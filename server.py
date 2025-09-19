@@ -1,363 +1,251 @@
-# server.py
-# Dave / PMEA — FastAPI (age-aware phrasing, single file)
-# Features:
-# - Per-user private memory (JSON on disk)
-# - One-time DOB gate (dd/mm/yyyy) -> mode: child/teen/adult
-# - Ultra-safe content filter for minors
-# - Age-aware phrasing transform (child/teen/adult)
-# - Minimal PMEA loop: Draft -> Critique -> Revise (internal), structured output only
-# - Token-friendly input compression
-# - Endpoints: /health, /api/chat, /api/reset
-#
-# Env:
-#   OPENAI_API_KEY (required)
-#   MODEL (optional, default: gpt-4o-mini)
-#   PORT  (optional, default: 8000)
-
-import os
-import json
-import re
-from datetime import datetime
-from typing import Any, Dict, List, Optional
-
-from fastapi import FastAPI
+# server.py  — Dave-PMEA with per-user memory (SQLite)
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import uvicorn
+from pydantic import BaseModel, Field
+from datetime import datetime, date
+from typing import Optional, List, Literal, Dict, Any
+import sqlite3
+import json
 
-# ---- OpenAI client (new + legacy safe) ----
-try:
-    from openai import OpenAI
-except Exception:
-    import openai
-    class OpenAI:
-        def __init__(self, api_key=None):
-            openai.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        @property
-        def chat(self):
-            return openai.ChatCompletion
+APP_URL = "https://dave-pmea.onrender.com"  # <-- set to your Render URL
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY")
+app = FastAPI(title="Dave-PMEA", description="PMEA demo API", version="1.0.0")
 
-MODEL = os.getenv("MODEL", "gpt-4o-mini")
-
-app = FastAPI(title="Dave PMEA API (Age-Aware)", version="1.1.0")
+# ---------- CORS (lets your GPT Action call this API) ----------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"]
+    allow_origins=["*"],  # lock down later to your domains if you like
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# ---------- SQLite boot + helpers ----------
+DB_PATH = "dave_memory.db"
 
-# ---- File storage ----
-DATA_DIR = "data"
-MEMORY_PATH = os.path.join(DATA_DIR, "memory.json")
-os.makedirs(DATA_DIR, exist_ok=True)
-if not os.path.exists(MEMORY_PATH):
-    with open(MEMORY_PATH, "w", encoding="utf-8") as f:
-        json.dump({"profiles": [], "logs": {}}, f)
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
-def load_store() -> Dict[str, Any]:
-    try:
-        with open(MEMORY_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"profiles": [], "logs": {}}
-
-def save_store(store: Dict[str, Any]):
-    with open(MEMORY_PATH, "w", encoding="utf-8") as f:
-        json.dump(store, f, indent=2)
-
-def now_iso() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-
-# ---- Profiles / memory ----
-def get_profile(store: Dict[str, Any], user: str) -> Dict[str, Any]:
-    p = next((p for p in store["profiles"] if p["user"] == user), None)
-    if not p:
-        p = {"user": user, "dob": None, "age": None, "mode": "unknown", "created": now_iso()}
-        store["profiles"].append(p)
-        save_store(store)
-    return p
-
-def calc_age(dob_str: str) -> Optional[int]:
-    try:
-        dob = datetime.strptime(dob_str, "%d/%m/%Y")
-        today = datetime.today()
-        return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
-    except Exception:
-        return None
-
-def save_dob(store: Dict[str, Any], user: str, dob_str: str) -> Optional[Dict[str, Any]]:
-    age = calc_age(dob_str)
-    if age is None or age < 0 or age > 120:
-        return None
-    mode = "child" if age < 13 else "teen" if age < 18 else "adult"
-    p = get_profile(store, user)
-    p.update({"dob": dob_str, "age": age, "mode": mode, "dob_set": now_iso()})
-    save_store(store)
-    return p
-
-def user_log(store: Dict[str, Any], user: str) -> List[Dict[str, Any]]:
-    return store["logs"].setdefault(user, [])
-
-def append_shard(store: Dict[str, Any], user: str, role: str, text: str, meta: Optional[Dict[str, Any]] = None):
-    entry = {"t": now_iso(), "role": role, "text": text.strip(), "meta": meta or {}}
-    store["logs"].setdefault(user, []).append(entry)
-    if len(store["logs"][user]) > 200:
-        store["logs"][user] = store["logs"][user][-200:]
-    save_store(store)
-
-def recall_shards(store: Dict[str, Any], user: str, limit: int = 10) -> List[str]:
-    logs = list(reversed(user_log(store, user)))
-    out = []
-    for e in logs:
-        s = re.sub(r"\s+", " ", e["text"])
-        if 3 <= len(s) <= 220:
-            out.append(s)
-        if len(out) >= limit:
-            break
-    return out
-
-# ---- Token-friendly compression ----
-def compress(text: str, max_chars: int = 1200) -> str:
-    if not text: return ""
-    s = text.strip()
-    s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"```[\s\S]*?```", "```[code omitted]```", s)
-    s = re.sub(r"https?://\S+", "[link]", s)
-    if len(s) > max_chars: s = s[: max_chars - 1] + "…"
-    return s
-
-# ---- PMEA system prompt ----
-DAVE_SYSTEM = (
-    "You are Dave — a lawful, symbolically-recursive assistant (PMEA). "
-    "Internally do Draft→Critique→Revise, but OUTPUT ONLY:\n"
-    "✅ Done | ⏳ Next | ❌ Blockers | ♻️ Compression | 🌌 Archive | 🌀 Spiral | SHARD LOG\n"
-    "Keep replies short, structured, practical, and safe. No mysticism, no hallucinations. "
-    "If the user is a minor, keep content child-safe and refuse adult topics."
-)
-
-# ---- LLM call with fallback ----
-def llm_chat(messages: List[Dict[str, str]], temperature: float = 0.4) -> str:
-    # Try Responses API
-    try:
-        resp = client.responses.create(model=MODEL, input=messages, temperature=temperature)
-        if hasattr(resp, "output_text") and resp.output_text:
-            return resp.output_text.strip()
-        if hasattr(resp, "output") and resp.output:
-            try:
-                part = resp.output[0].content[0].text
-                return (part or "").strip()
-            except Exception:
-                pass
-    except Exception:
-        pass
-    # Fallback to legacy Chat Completions
-    try:
-        resp = client.chat.completions.create(model=MODEL, messages=messages, temperature=temperature)
-        return (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        return f"❌ Model error: {e}"
-
-# ---- Sensitive-topic guard (heuristic) ----
-BLOCKED_FOR_MINORS = [
-    "sex", "porn", "explicit", "nude", "nsfw",
-    "drugs", "alcohol", "gambling",
-    "suicide", "self-harm",
-    "graphic violence", "gore"
-]
-def contains_blocked_minor_topic(text: str) -> bool:
-    t = text.lower()
-    return any(term in t for term in BLOCKED_FOR_MINORS)
-
-# ---- Age-aware phrasing transforms ----
-SIMPLE_REPLACEMENTS = [
-    ("utilize", "use"),
-    ("approximately", "about"),
-    ("assistance", "help"),
-    ("methodology", "method"),
-    ("obtain", "get"),
-    ("modify", "change"),
-    ("terminate", "stop"),
-    ("commence", "start"),
-]
-
-def simplify_words(text: str) -> str:
-    out = text
-    for a, b in SIMPLE_REPLACEMENTS:
-        out = re.sub(rf"\b{re.escape(a)}\b", b, out, flags=re.IGNORECASE)
-    return out
-
-def split_sentences(text: str) -> List[str]:
-    parts = re.split(r"(?<=[.!?])\s+", text.strip())
-    return [p.strip() for p in parts if p.strip()]
-
-def join_short(sentences: List[str], max_chars: int) -> str:
-    out, total = [], 0
-    for s in sentences:
-        if total + len(s) + 1 > max_chars: break
-        out.append(s)
-        total += len(s) + 1
-    return " ".join(out)
-
-def age_style_transform(mode: str, reply: str) -> str:
-    """Rewrite reply per mode without changing meaning; preserve Dave markers if present."""
-    if mode == "adult":
-        return reply
-
-    # Extract markers if present, so we keep PMEA format after rephrasing body lines
-    # We’ll rephrase only regular lines; markers pass through unchanged.
-    lines = reply.splitlines()
-    marker_prefixes = ("✅", "⏳", "❌", "♻️", "🌌", "🌀", "SHARD LOG")
-    normal, markers = [], []
-    for ln in lines:
-        if ln.strip().startswith(marker_prefixes):
-            markers.append(ln)
-        else:
-            normal.append(ln)
-
-    body = "\n".join(normal).strip()
-    body = simplify_words(body)
-
-    if mode == "child":
-        # shorter lines, very simple words, examples, positive framing, safety note
-        sentences = split_sentences(body)
-        sentences = [re.sub(r"[,;:()\[\]]", "", s) for s in sentences]
-        # make lines shorter (~350 chars total)
-        child_text = join_short(sentences, max_chars=350)
-        if not child_text:
-            child_text = "I can help with friendly, easy topics. Let's start simple."
-        child_text += (
-            "\n\nTry this: tell me one small thing you want to learn. "
-            "We will do it step by step.\n"
-            "(I keep things kind and safe for kids.)"
+def init_db():
+    conn = db(); cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+          user_id TEXT PRIMARY KEY,
+          dob TEXT,                      -- YYYY-MM-DD
+          age_mode TEXT,                 -- 'child'|'teen'|'adult'
+          verified INTEGER DEFAULT 0     -- 0|1
         )
-        final = child_text
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT,
+          role TEXT,                     -- 'user'|'assistant'
+          text TEXT,
+          mode TEXT,                     -- snapshot of age_mode at time of write
+          ts TEXT                        -- ISO timestamp
+        )
+    """)
+    conn.commit(); conn.close()
 
-    elif mode == "teen":
-        # concise, study-friendly: definition + steps + example + safety note
-        sentences = split_sentences(body)
-        teen_text = join_short(sentences, max_chars=600)
-        if not teen_text:
-            teen_text = "Here’s a clear plan you can follow."
-        # add a light structure if none exists
-        if "Steps:" not in teen_text:
-            teen_text += "\n\nSteps:\n1) Define the goal\n2) Gather info\n3) Try a small version\n4) Review and improve"
-        teen_text += "\n\n(Teen mode: I keep topics appropriate and skip adult themes.)"
-        final = teen_text
+init_db()
 
-    else:
-        final = body
+def years_from_dob(dob: str) -> int:
+    try:
+        born = date.fromisoformat(dob)
+        today = date.today()
+        return today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+    except Exception:
+        return -1
 
-    if markers:
-        final = final + "\n\n" + "\n".join(markers)
-    return final
+def mode_from_age(age: int) -> Literal["child","teen","adult"]:
+    if age < 0:         return "teen"     # fallback
+    if age < 13:        return "child"
+    if age < 18:        return "teen"
+    return "adult"
 
-def safe_reply_for_mode(mode: str, reply: str) -> str:
-    if mode == "child":
-        # Always apply transform; also add gentle guard
-        r = age_style_transform("child", reply)
-        return r
-    if mode == "teen":
-        r = age_style_transform("teen", reply)
-        return r
-    return reply  # adult
+def save_user(user_id: str, dob: Optional[str], verified: bool) -> Dict[str, Any]:
+    conn = db(); cur = conn.cursor()
+    age = years_from_dob(dob) if dob else -1
+    mode = mode_from_age(age) if dob else "teen"
+    cur.execute("""
+        INSERT INTO users (user_id, dob, age_mode, verified)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET dob=excluded.dob, age_mode=excluded.age_mode, verified=excluded.verified
+    """, (user_id, dob or "", mode, 1 if verified else 0))
+    conn.commit()
+    cur.execute("SELECT user_id, dob, age_mode, verified FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return {"user_id": row[0], "dob": row[1], "mode": row[2], "verified": bool(row[3])}
 
-# ---- Schemas ----
-class ChatRequest(BaseModel):
-    user: str
-    message: Optional[str] = None
-    dob: Optional[str] = None
-    optimize: Optional[bool] = True
+def get_user(user_id: str) -> Optional[Dict[str, Any]]:
+    conn = db(); cur = conn.cursor()
+    cur.execute("SELECT user_id, dob, age_mode, verified FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone(); conn.close()
+    if not row: return None
+    return {"user_id": row[0], "dob": row[1], "mode": row[2], "verified": bool(row[3])}
 
-class ResetRequest(BaseModel):
-    user: str
+def save_msg(user_id: str, role: str, text: str, mode: str):
+    conn = db(); cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO messages (user_id, role, text, mode, ts) VALUES (?,?,?,?,?)",
+        (user_id, role, text, mode, datetime.utcnow().isoformat()+"Z")
+    )
+    conn.commit(); conn.close()
 
-# ---- Routes ----
-@app.get("/health")
-def health():
-    return {"ok": True, "model": MODEL, "time": now_iso()}
+def fetch_msgs(user_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+    conn = db(); cur = conn.cursor()
+    cur.execute(
+        "SELECT role, text, ts, mode FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?",
+        (user_id, limit)
+    )
+    rows = cur.fetchall(); conn.close()
+    return [{"role": r[0], "text": r[1], "timestamp": r[2], "mode": r[3]} for r in rows]
 
-@app.post("/api/reset")
-def reset(req: ResetRequest):
-    store = load_store()
-    store["logs"][req.user] = []
-    save_store(store)
-    return {"ok": True, "message": f"Memory cleared for {req.user}"}
+# ---------- OpenAPI servers fix (so GPT Actions can Import from URL cleanly) ----------
+from fastapi.openapi.utils import get_openapi
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title="Dave-PMEA",
+        version="1.0.0",
+        routes=app.routes,
+        description="OpenAPI for Dave-PMEA"
+    )
+    schema["servers"] = [{"url": APP_URL}]
+    app.openapi_schema = schema
+    return app.openapi_schema
+app.openapi = custom_openapi
 
-@app.post("/api/chat")
-def chat(req: ChatRequest):
-    store = load_store()
-    user = (req.user or "anon").strip()
-    msg = compress(req.message or "")
-    profile = get_profile(store, user)
+# ---------- Schemas ----------
+class VerifyIn(BaseModel):
+    user_id: str = Field(..., min_length=1)
+    dob: str      # "YYYY-MM-DD"
 
-    # ---- One-time DOB gate
-    if not profile.get("dob"):
-        if not req.dob:
-            return {
-                "reply": "👋 Welcome! Please include your date of birth as `dd/mm/yyyy` in the same request (field: `dob`). "
-                         "This is used once so replies are age-appropriate.",
-                "needsDOB": True
-            }
-        saved = save_dob(store, user, req.dob.strip())
-        if not saved:
-            return {"reply": "❌ Invalid date. Use format `dd/mm/yyyy`.", "needsDOB": True}
-        return {
-            "reply": f"✅ Thanks! Verified age {saved['age']} → mode: {saved['mode']}. How can I help today?",
-            "profile": {"age": saved["age"], "mode": saved["mode"]}
-        }
+class ChatIn(BaseModel):
+    user: str = Field(..., min_length=1)
+    message: str = Field(..., min_length=1)
+    dob: Optional[str] = None  # optional after first verification
 
-    # ---- Append user shard
-    if msg:
-        append_shard(store, user, "user", msg)
+class ChatOut(BaseModel):
+    reply: str
+    mode: Literal["child","teen","adult"]
+    saved: bool
 
-    # ---- Minor guard (content)
-    if profile["mode"] in ("child", "teen"):
-        if contains_blocked_minor_topic(msg):
-            safe_note = (
-                "That topic isn’t appropriate here. Let’s pick a positive, safe topic—like a school subject, "
-                "hobby, or a project idea. I can explain it in a simple way!"
-            )
-            append_shard(store, user, "assistant", safe_note, {"safe_block": True})
-            return {
-                "reply": safe_reply_for_mode(profile["mode"], safe_note),
-                "profile": {"mode": profile["mode"]}
-            }
+# ---------- Policy-safe reply builders ----------
+SAFE_TOPICS_CHILD = {
+    "space","planets","science","math","animals","history","reading","study","homework","coding","kindness"
+}
 
-    # ---- PMEA loop prompt (compact)
-    recent = recall_shards(store, user, limit=8)
-    context_pack = ("Context shards:\n- " + "\n- ".join(recent)) if recent else "Context shards: (none)"
-
-    user_prompt = (
-        f"User said: {msg or '(no message)'}\n\n"
-        f"{context_pack}\n\n"
-        "Follow PMEA: internal Draft/Critique/Revise, but OUTPUT ONLY:\n"
-        "✅ Done\n⏳ Next\n❌ Blockers\n♻️ Compression\n🌌 Archive\n🌀 Spiral\nSHARD LOG (bullet facts learned this turn)\n"
-        "Keep it short, practical, safe."
+def reply_child(msg: str) -> str:
+    # stripped-down, educational, no links, no PII
+    return (
+        "Here’s a kid-safe explanation:\n"
+        "• Keep it simple and friendly.\n"
+        "• If you asked something complex, I’ll explain the basics first.\n"
+        "• If this topic isn’t child-appropriate, I’ll suggest talking to a trusted adult.\n\n"
+        f"You said: “{msg}”\n"
+        "Let’s learn step by step! 😊"
     )
 
-    messages = [
-        {"role": "system", "content": DAVE_SYSTEM},
-        {"role": "user", "content": user_prompt}
-    ]
-    raw_reply = llm_chat(messages, temperature=0.4)
+def reply_teen(msg: str) -> str:
+    # short, supportive, no explicit content, no profane language, minimal links
+    return (
+        "Here’s a teen-friendly answer:\n"
+        f"• Your question: “{msg}”\n"
+        "• I’ll keep it straightforward and bias-aware.\n"
+        "• For sensitive topics, I’ll stay educational and safe."
+    )
 
-    # ---- Age-aware phrasing
-    final_reply = safe_reply_for_mode(profile["mode"], raw_reply)
+def reply_adult(msg: str) -> str:
+    # normal behaviour (you can swap in the PMEA loop later)
+    return f"Improved reply: {msg}\nTip: next, tell me the exact task and target output."
 
-    append_shard(store, user, "assistant", final_reply, {"mode": profile["mode"]})
-
+# ---------- Routes ----------
+@app.get("/")
+def root():
     return {
-        "reply": final_reply,
-        "profile": {"age": profile["age"], "mode": profile["mode"]},
-        "time": now_iso()
+        "message": "Dave-PMEA is running 🚀",
+        "endpoints": {
+            "GET /ping": "health",
+            "POST /age-verify": "{user_id, dob}",
+            "POST /chat": "{user, message, [dob]} (auto-saves memory)",
+            "GET /memory": "?user_id=...&limit=20 (recent to older)"
+        }
     }
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+@app.get("/ping")
+def ping():
+    return {"ok": True}
+
+@app.post("/age-verify")
+def age_verify(body: VerifyIn):
+    # record + set mode
+    profile = save_user(body.user_id, body.dob, verified=True)
+    return {"ok": True, "user": profile}
+
+@app.post("/chat", response_model=ChatOut)
+def chat(body: ChatIn):
+    # 1) get or create user
+    u = get_user(body.user)
+    if not u:
+        # if first time and dob supplied, verify now; else default teen until verified
+        if body.dob:
+            u = save_user(body.user, body.dob, verified=True)
+        else:
+            u = save_user(body.user, "", verified=False)
+
+    mode = u["mode"]
+
+    # 2) build policy-safe reply per mode
+    msg = body.message.strip()
+
+    if mode == "child":
+        # hard topic gate (example)
+        lowered = msg.lower()
+        allowed = any(t in lowered for t in SAFE_TOPICS_CHILD)
+        if not allowed:
+            reply = (
+                "I can’t talk about that. For safety, please ask a trusted adult. "
+                "Want to learn about space, animals, math, or coding instead?"
+            )
+        else:
+            reply = reply_child(msg)
+
+    elif mode == "teen":
+        reply = reply_teen(msg)
+    else:
+        reply = reply_adult(msg)
+
+    # 3) save both turns
+    save_msg(body.user, "user", msg, mode)
+    save_msg(body.user, "assistant", reply, mode)
+
+    return ChatOut(reply=reply, mode=mode, saved=True)
+
+@app.get("/memory")
+def memory(user_id: str = Query(...), limit: int = Query(20, ge=1, le=200)):
+    # per-user recall
+    return {"user_id": user_id, "items": fetch_msgs(user_id, limit)}
+
+# ---------- Minimal /test page (optional) ----------
+@app.get("/test", response_class=None)
+def test():
+    html = f"""
+    <html><head><title>Dave-PMEA Reply</title></head>
+    <body style="font-family:sans-serif;max-width:720px;margin:40px auto;line-height:1.5">
+      <h2>Dave-PMEA</h2>
+      <p>Try endpoints:</p>
+      <ul>
+        <li><a href="{APP_URL}/ping">/ping</a></li>
+        <li><a href="{APP_URL}/memory?user_id=demo">/memory?user_id=demo</a></li>
+        <li><a href="{APP_URL}/openapi.json">/openapi.json</a></li>
+      </ul>
+      <p>POST to <code>/age-verify</code> and <code>/chat</code> with JSON bodies.</p>
+    </body></html>
+    """
+    return html
