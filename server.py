@@ -1,94 +1,87 @@
-# server.py  — Dave-PMEA API (clean reset)
+# server.py  — Dave-PMEA minimal API with SQLite memory
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List
-from fastapi.responses import HTMLResponse
-from fastapi.openapi.utils import get_openapi
+from typing import List, Dict, Any
 import sqlite3
-from datetime import datetime
+from contextlib import closing
+from pathlib import Path
 
-# ------------------ App ------------------
-app = FastAPI(title="Dave-PMEA", version="1.0.0", description="PMEA demo API")
+# ---------- App ----------
+app = FastAPI(title="Dave-PMEA", description="PMEA demo API", version="1.0.0")
 
-# ------------------ DB (auto-create) ------------------
-DB_PATH = "dave_memory.db"
+# ---------- SQLite (simple, file in working dir) ----------
+DB_PATH = Path("dave_memory.db")
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS memory (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        role TEXT,
-        text TEXT,
-        ts DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    conn.commit()
-    conn.close()
+def init_db() -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                role TEXT NOT NULL,
+                text TEXT NOT NULL,
+                t   DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_t ON memory(t DESC)")
+        conn.commit()
 
-def save_memory(role: str, text: str):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("INSERT INTO memory(role, text) VALUES(?, ?)", (role, text))
-    conn.commit()
-    conn.close()
+def save_memory(role: str, text: str) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("INSERT INTO memory(role, text) VALUES (?, ?)", (role, text))
+        conn.commit()
 
-def read_memory(limit: int = 20):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT role, text, ts FROM memory ORDER BY id DESC LIMIT ?", (limit,))
-    rows = cur.fetchall()
-    conn.close()
-    return [{"role": r, "text": t, "ts": ts} for (r, t, ts) in rows]
+def read_memory(limit: int = 20) -> List[Dict[str, Any]]:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, role, text, t FROM memory ORDER BY t DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
+# Make sure DB exists on startup
 init_db()
 
-# ------------------ Models ------------------
+# ---------- Models ----------
 class UserInput(BaseModel):
     text: str
 
-# ------------------ Routes ------------------
-@app.get("/ping")
-def ping():
-    return {"status": "ok"}
-
-@app.get("/", response_class=HTMLResponse)
-def root():
-    return """
-    <html>
-      <head><title>Dave-PMEA</title></head>
-      <body style="font-family:sans-serif">
-        <p>✅ Dave-PMEA is running.</p>
-        <ul>
-          <li>GET <code>/ping</code></li>
-          <li>POST <code>/dave</code>  (body: {"text":"hello"})</li>
-          <li>GET <code>/memory</code></li>
-        </ul>
-      </body>
-    </html>
-    """
-
-@app.post("/dave")
-def dave_endpoint(user: UserInput):
-    # minimal PMEA-style echo
-    user_text = user.text.strip()
-    reply = f"Improved reply: {user_text}\nTip: next, tell me the exact task and target output."
-    save_memory("user", user_text)
-    save_memory("assistant", reply)
+# ---------- Routes ----------
+@app.get("/")
+def root() -> Dict[str, Any]:
     return {
-        "reply": reply,
-        "✅ Done": "Drafted, critiqued, revised (minimal).",
-        "⏳ Next": "Give me your exact task + target output.",
-        "❌ Blockers": None,
-        "♻️ Compression": "Not needed",
+        "message": "Dave-PMEA is running",
+        "endpoints": {
+            "GET /ping": "health check",
+            "POST /dave": "talk to Dave (body: {'text': 'hello'})",
+            "GET /memory": "last 20 stored lines",
+        },
     }
 
-@app.get("/memory")
-def memory_endpoint():
-    return {"items": read_memory(20)}
+@app.get("/ping")
+def ping() -> Dict[str, str]:
+    return {"status": "ok"}
 
-# ------------------ OpenAPI `servers` fix ------------------
+@app.post("/dave")
+def dave(user: UserInput) -> Dict[str, str]:
+    # store user turn
+    save_memory("user", user.text)
+
+    # --- PMEA placeholder: DRAFT -> CRITIQUE -> REVISE (simplified) ---
+    # For now we just return a concise, improved echo.
+    reply = f"Improved reply: {user.text}"
+
+    # store assistant turn
+    save_memory("assistant", reply)
+
+    return {"reply": reply}
+
+@app.get("/memory")
+def memory() -> Dict[str, Any]:
+    return {"items": read_memory(limit=20)}
+
+# ---------- OpenAPI servers fix (so GPT Builder import-from-URL works) ----------
+from fastapi.openapi.utils import get_openapi
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
@@ -98,7 +91,7 @@ def custom_openapi():
         routes=app.routes,
         description=app.description,
     )
-    # 🔧 SET THIS TO YOUR RENDER URL EXACTLY
+    # Update this URL if your Render URL is different
     schema["servers"] = [{"url": "https://dave-pmea.onrender.com"}]
     app.openapi_schema = schema
     return app.openapi_schema
