@@ -1,296 +1,306 @@
-# server.py — Dave-PMEA (Ultra-Safe) with per-user memory, consent & purge
-from fastapi import FastAPI, HTTPException, Query
+# server.py  — Dave-PMEA (full, paste-in replacement)
+# - FastAPI app with:
+#   • PMEA loop (draft → critique → revise)
+#   • Per-user memory (SQLite) → /memory?user_id=…
+#   • Age verify + ultra-safe modes (child/teen/adult)
+#   • Test endpoints + OpenAPI servers fix (for GPT Actions import)
+#   • CORS enabled (so ChatGPT Actions can call it)
+
+from fastapi import FastAPI, Request, Body
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from datetime import datetime, date
-from typing import Optional, List, Literal, Dict, Any
-import sqlite3
-import re
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+import sqlite3, re, os
 
-APP_URL = "https://dave-pmea.onrender.com"  # <— set to your Render URL
+# -----------------------------------------------------------------------------
+# App
+# -----------------------------------------------------------------------------
+app = FastAPI(title="Dave-PMEA", version="1.0.0", description="PMEA demo API")
 
-app = FastAPI(title="Dave-PMEA", description="PMEA demo API (Ultra-Safe)", version="1.1.0")
+# CORS (keep simple; you can lock this down later)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],    # lock down to your domains later
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ------------------------- DB -------------------------
+# -----------------------------------------------------------------------------
+# DB (SQLite) — per-user memory + users table
+# -----------------------------------------------------------------------------
 DB_PATH = "dave_memory.db"
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
-
 def init_db():
-    conn = db(); cur = conn.cursor()
-    cur.execute("""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    # Per-user memory
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            role    TEXT,
+            text    TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Users (for age + verification + mode)
+    c.execute("""
         CREATE TABLE IF NOT EXISTS users (
-          user_id TEXT PRIMARY KEY,
-          dob TEXT,                    -- YYYY-MM-DD
-          age_mode TEXT,               -- child|teen|adult
-          verified INTEGER DEFAULT 0,  -- 0|1
-          guardian_consented INTEGER DEFAULT 0, -- 0|1 (for <13)
-          created_ts TEXT
+            user_id TEXT PRIMARY KEY,
+            age     INTEGER,
+            verified INTEGER DEFAULT 0,
+            mode    TEXT
         )
     """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id TEXT,
-          role TEXT,                 -- user|assistant
-          text TEXT,
-          mode TEXT,                 -- snapshot at write
-          ts TEXT
-        )
-    """)
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
+
 init_db()
 
-# ------------------------- Age/Mode helpers -------------------------
-def years_from_dob(dob: str) -> int:
-    try:
-        born = date.fromisoformat(dob)
-        today = date.today()
-        return today.year - born.year - ((today.month, today.day) < (born.month, born.day))
-    except Exception:
-        return -1
+def save_memory(user_id: str, role: str, text: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO memory (user_id, role, text) VALUES (?, ?, ?)",
+              (user_id, role, text))
+    conn.commit()
+    conn.close()
 
-def mode_from_age(age: int) -> Literal["child","teen","adult"]:
-    if age < 0:   return "teen"
-    if age < 13:  return "child"
-    if age < 18:  return "teen"
-    return "adult"
+def fetch_memory(user_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT role, text, timestamp
+        FROM memory
+        WHERE user_id=?
+        ORDER BY id DESC
+        LIMIT ?
+    """, (user_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return [{"role": r[0], "text": r[1], "timestamp": r[2]} for r in rows]
 
-def upsert_user(user_id: str, dob: Optional[str], verified: bool, guardian_consented: Optional[bool] = None):
-    age = years_from_dob(dob) if dob else -1
-    mode = mode_from_age(age) if dob else "teen"
-    cons = 1 if guardian_consented else 0
-    conn = db(); cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO users (user_id, dob, age_mode, verified, guardian_consented, created_ts)
-        VALUES (?, ?, ?, ?, ?, ?)
+def set_user(user_id: str, age: int, verified: bool, mode: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO users (user_id, age, verified, mode)
+        VALUES (?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
-          dob=excluded.dob,
-          age_mode=excluded.age_mode,
-          verified=excluded.verified,
-          guardian_consented=COALESCE(NULLIF(excluded.guardian_consented,0), users.guardian_consented)
-    """, (user_id, dob or "", mode, 1 if verified else 0, cons, datetime.utcnow().isoformat()+"Z"))
-    conn.commit(); conn.close()
-    return get_user(user_id)
+            age=excluded.age,
+            verified=excluded.verified,
+            mode=excluded.mode
+    """, (user_id, age, int(verified), mode))
+    conn.commit()
+    conn.close()
 
 def get_user(user_id: str) -> Optional[Dict[str, Any]]:
-    conn = db(); cur = conn.cursor()
-    cur.execute("SELECT user_id, dob, age_mode, verified, guardian_consented, created_ts FROM users WHERE user_id=?", (user_id,))
-    r = cur.fetchone(); conn.close()
-    if not r: return None
-    return {
-        "user_id": r[0], "dob": r[1], "mode": r[2],
-        "verified": bool(r[3]), "guardian_consented": bool(r[4]),
-        "created_ts": r[5]
-    }
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_id, age, verified, mode FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"user_id": row[0], "age": row[1], "verified": bool(row[2]), "mode": row[3]}
 
-def save_msg(user_id: str, role: str, text: str, mode: str):
-    conn = db(); cur = conn.cursor()
-    cur.execute("INSERT INTO messages (user_id, role, text, mode, ts) VALUES (?,?,?,?,?)",
-                (user_id, role, text, mode, datetime.utcnow().isoformat()+"Z"))
-    conn.commit(); conn.close()
-
-def fetch_msgs(user_id: str, limit: int = 20) -> List[Dict[str, Any]]:
-    conn = db(); cur = conn.cursor()
-    cur.execute("SELECT role, text, ts, mode FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?", (user_id, limit))
-    rows = cur.fetchall(); conn.close()
-    return [{"role": r[0], "text": r[1], "timestamp": r[2], "mode": r[3]} for r in rows]
-
-def purge_user(user_id: str) -> int:
-    conn = db(); cur = conn.cursor()
-    cur.execute("DELETE FROM messages WHERE user_id=?", (user_id,))
-    n1 = cur.rowcount
-    cur.execute("DELETE FROM users WHERE user_id=?", (user_id,))
-    n2 = cur.rowcount
-    conn.commit(); conn.close()
-    return n1 + n2
-
-# ------------------------- Safety rules -------------------------
-SAFE_TOPICS_CHILD = {
-    "space","planet","planets","science","stars","math","animals","history",
-    "reading","homework","coding","programming","kindness","friendship","safety","exercise"
-}
-RISKY_TEEN_KEYWORDS = {
-    "explicit","porn","gambling","hard drug","self-harm","suicide","extremist","bomb","weapon"
+# -----------------------------------------------------------------------------
+# Safety / Modes
+# -----------------------------------------------------------------------------
+ALLOWED_CHILD_TOPICS = {
+    "space", "planets", "stars", "animals", "dinosaurs", "math", "reading",
+    "history (general)", "science for kids"
 }
 
-URL_RE = re.compile(r"(https?://\S+|www\.\S+)")
-EMAIL_RE = re.compile(r"\b[\w\.-]+@[\w\.-]+\.\w{2,}\b")
-PHONE_RE = re.compile(r"\b\+?\d[\d\s\-]{6,}\d\b")
+PII_PATTERNS = [
+    r"\b\d{3}[- ]?\d{2}[- ]?\d{4}\b",   # SSN-like
+    r"\b\d{10,16}\b",                   # long digit strings (phone/card)
+    r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+    r"https?://\S+",
+]
+PII_REGEX = [re.compile(p, re.IGNORECASE) for p in PII_PATTERNS]
 
-def sanitize(text: str, strip_links=True, strip_pii=True, max_len=500) -> str:
-    t = text[:max_len]
-    if strip_links:
-        t = URL_RE.sub("[link removed]", t)
-    if strip_pii:
-        t = EMAIL_RE.sub("[email removed]", t)
-        t = PHONE_RE.sub("[phone removed]", t)
-    return t
+def determine_mode(age: Optional[int]) -> str:
+    if age is None:
+        return "adult"      # default if unknown
+    if age < 13:
+        return "child"
+    if age < 18:
+        return "teen"
+    return "adult"
 
-def teen_blocked(text: str) -> bool:
-    low = text.lower()
-    return any(k in low for k in RISKY_TEEN_KEYWORDS)
+def sanitize_text_for_teen(text: str) -> str:
+    # Strip links & obvious PII tokens; keep short
+    t = text
+    for rx in PII_REGEX:
+        t = rx.sub("[redacted]", t)
+    # keep it concise
+    return t[:500]
 
-# Replies (minimal; keep it ultra safe)
-def reply_child(msg: str) -> str:
-    return (
-        "Kid-safe mode:\n"
-        "• I'll explain simply and kindly.\n"
-        "• No links or personal info.\n\n"
-        f"You asked: “{sanitize(msg)}”. Let’s learn step by step! 😊"
-    )
+def ultra_safe_reply(user_message: str, mode: str) -> str:
+    if mode == "child":
+        # Allow-list simple topics; otherwise redirect
+        topic = user_message.lower()
+        allowed = any(key in topic for key in ALLOWED_CHILD_TOPICS)
+        if not allowed:
+            return ("I can help with safe topics like space, animals, math, "
+                    "reading, and simple science. For other things, please ask a trusted adult.")
+        # Give a short, gentle educational reply
+        return ("Here’s a kid-friendly explanation:\n"
+                f"• {user_message.strip().capitalize()} is interesting!\n"
+                "• Let’s explore it simply and safely.\n"
+                "• Do you want a short fact list or a mini story?")
+    elif mode == "teen":
+        return sanitize_text_for_teen(
+            "Let’s keep this short and safe. "
+            "I’ll give you the key points and next steps to learn more."
+        )
+    else:
+        # adult → normal
+        return "Okay—what’s the exact task and target output?"
 
-def reply_teen(msg: str) -> str:
-    if teen_blocked(msg):
-        return "I can’t help with that topic. Let’s keep it safe and educational."
-    return (
-        "Teen-safe answer:\n"
-        f"• Your question: “{sanitize(msg)}”\n"
-        "• I’ll keep things short, supportive, and age-appropriate."
-    )
+# -----------------------------------------------------------------------------
+# PMEA loop (small, fast)
+# -----------------------------------------------------------------------------
+def pmea_reply(message: str) -> str:
+    # DRAFT
+    draft = f"Draft: {message}"
+    # CRITIQUE
+    issues = []
+    if len(message) < 6:
+        issues.append("too short")
+    if "?" not in message and "help" not in message.lower():
+        issues.append("may lack clear ask")
+    critique = f"Issues: {', '.join(issues) or 'none'}"
+    # REVISE
+    tip = "Tip: tell me the exact task + output format."
+    revise = f"Improved reply: {message}\n{tip}"
+    return revise
 
-def reply_adult(msg: str) -> str:
-    return f"Improved reply: {sanitize(msg, max_len=1200)}\nTip: next, tell me the exact task and target output."
-
-# ------------------------- OpenAPI servers fix -------------------------
-from fastapi.openapi.utils import get_openapi
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    schema = get_openapi(
-        title="Dave-PMEA",
-        version="1.1.0",
-        routes=app.routes,
-        description="OpenAPI for Dave-PMEA (Ultra-Safe)",
-    )
-    schema["servers"] = [{"url": APP_URL}]
-    app.openapi_schema = schema
-    return app.openapi_schema
-app.openapi = custom_openapi
-
-# ------------------------- Schemas -------------------------
-class VerifyIn(BaseModel):
-    user_id: str = Field(..., min_length=1)
-    dob: str      # "YYYY-MM-DD"
-    guardian_consented: Optional[bool] = False  # if under 13
-
-class ConsentIn(BaseModel):
+# -----------------------------------------------------------------------------
+# Schemas
+# -----------------------------------------------------------------------------
+class AgeVerifyIn(BaseModel):
     user_id: str
-    guardian_consented: bool
+    age: int
 
 class ChatIn(BaseModel):
-    user: str = Field(..., min_length=1)
-    message: str = Field(..., min_length=1)
-    dob: Optional[str] = None  # optional after first verify
-
-class ChatOut(BaseModel):
-    reply: str
-    mode: Literal["child","teen","adult"]
-    saved: bool
-
-class PurgeIn(BaseModel):
     user_id: str
+    message: str
+    dob: Optional[str] = None  # not used for mode (age verify does that); kept for context if you want it later
 
-# ------------------------- Routes -------------------------
-@app.get("/")
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
 def root():
-    return {
-        "message": "Dave-PMEA (Ultra-Safe) is running 🚀",
-        "endpoints": {
-            "GET /ping": "health",
-            "POST /age-verify": "{user_id, dob, guardian_consented?}",
-            "POST /set-consent": "{user_id, guardian_consented}",
-            "POST /chat": "{user, message, [dob]} (per-user safe behaviour + memory)",
-            "GET /memory": "?user_id=...&limit=20",
-            "DELETE /delete-my-data": "{user_id}"
-        }
-    }
+    return """
+    <h3>✅ Dave-PMEA is running.</h3>
+    <ul>
+      <li>GET  <code>/ping</code></li>
+      <li>GET  <code>/healthz</code></li>
+      <li>POST <code>/age-verify</code>  (json: {"user_id","age"})</li>
+      <li>POST <code>/chat</code>        (json: {"user_id","message"})</li>
+      <li>GET  <code>/memory?user_id=...&limit=20</code></li>
+      <li>GET  <code>/openapi.json</code> (for GPT Actions “Import from URL”)</li>
+      <li>GET  <code>/test</code> (simple form)</li>
+    </ul>
+    """
 
 @app.get("/ping")
 def ping():
     return {"ok": True}
 
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
 @app.post("/age-verify")
-def age_verify(body: VerifyIn):
-    profile = upsert_user(body.user_id, body.dob, verified=True, guardian_consented=body.guardian_consented)
-    return {"ok": True, "user": profile}
+def age_verify(payload: AgeVerifyIn):
+    mode = determine_mode(payload.age)
+    set_user(payload.user_id, payload.age, verified=True, mode=mode)
+    return {"ok": True, "user": payload.user_id, "age": payload.age, "mode": mode}
 
-@app.post("/set-consent")
-def set_consent(body: ConsentIn):
-    u = get_user(body.user_id)
-    if not u:
-        raise HTTPException(404, "user not found")
-    upsert_user(body.user_id, u["dob"], verified=u["verified"], guardian_consented=body.guardian_consented)
-    return {"ok": True, "user": get_user(body.user_id)}
+@app.post("/chat")
+def chat(payload: ChatIn):
+    # find or default user record
+    u = get_user(payload.user_id)
+    mode = u["mode"] if u else "adult"
 
-@app.post("/chat", response_model=ChatOut)
-def chat(body: ChatIn):
-    # Ensure user exists / verify inline if first time
-    u = get_user(body.user)
-    if not u:
-        u = upsert_user(body.user, body.dob or "", verified=bool(body.dob), guardian_consented=False)
+    # ultra-safe entry wrapper
+    guard = ultra_safe_reply(payload.message, mode)
 
-    mode = u["mode"]
-    msg  = body.message.strip()
+    # produce answer (PMEA) then post-filter if needed
+    revised = pmea_reply(payload.message)
 
-    # CHILD: enforce topic whitelist + consent
     if mode == "child":
-        allowed = any(tok in msg.lower() for tok in SAFE_TOPICS_CHILD)
-        if not allowed:
-            reply = ("I can’t talk about that. Please ask a trusted adult. "
-                     "Would you like to learn about space, animals, math, coding, or reading instead?")
-            # no storage for disallowed content
-            return ChatOut(reply=reply, mode=mode, saved=False)
+        # Child: we do NOT store memory and return the safe wrapper (short reply).
+        # You can also return a mini educational answer here if desired.
+        return {"reply": guard, "mode": mode, "stored": False}
 
-        if not u["guardian_consented"]:
-            reply = ("I need a parent or guardian to give consent before we can chat normally. "
-                     "They can do this at /set-consent. Here’s a safe mini-explanation while you wait:\n"
-                     + reply_child(msg))
-            # do not save anything for non-consented child
-            return ChatOut(reply=reply, mode=mode, saved=False)
-
-        # consented + allowed
-        reply = reply_child(msg)
-        save_msg(body.user, "user", sanitize(msg), mode)
-        save_msg(body.user, "assistant", reply, mode)
-        return ChatOut(reply=reply, mode=mode, saved=True)
-
-    # TEEN: block risky, sanitize, but save memory
+    # Teen: store but keep outcomes short/sanitized
     if mode == "teen":
-        r = reply_teen(msg)
-        save_msg(body.user, "user", sanitize(msg), mode)
-        save_msg(body.user, "assistant", r, mode)
-        return ChatOut(reply=r, mode=mode, saved=True)
+        out = sanitize_text_for_teen(revised)
+        save_memory(payload.user_id, "user", payload.message)
+        save_memory(payload.user_id, "assistant", out)
+        return {"reply": out, "mode": mode, "stored": True}
 
-    # ADULT: normal behaviour
-    r = reply_adult(msg)
-    save_msg(body.user, "user", sanitize(msg, max_len=1200), mode)
-    save_msg(body.user, "assistant", r, mode)
-    return ChatOut(reply=r, mode=mode, saved=True)
+    # Adult: normal behaviour + memory
+    save_memory(payload.user_id, "user", payload.message)
+    save_memory(payload.user_id, "assistant", revised)
+    return {"reply": revised, "mode": mode, "stored": True}
+
+# Back-compat alias if you want /api/chat too
+@app.post("/api/chat")
+def chat_alias(payload: ChatIn):
+    return chat(payload)
 
 @app.get("/memory")
-def memory(user_id: str = Query(...), limit: int = Query(20, ge=1, le=200)):
-    return {"user_id": user_id, "items": fetch_msgs(user_id, limit)}
+def memory(user_id: str, limit: int = 20):
+    # Child → intentionally returns empty by policy
+    u = get_user(user_id)
+    if u and u["mode"] == "child":
+        return {"history": []}
+    return {"history": fetch_memory(user_id, limit)}
 
-@app.delete("/delete-my-data")
-def delete_my_data(body: PurgeIn):
-    deleted = purge_user(body.user_id)
-    return {"ok": True, "deleted_rows": deleted}
+# Tiny test UI
+@app.get("/test", response_class=HTMLResponse)
+def test_page():
+    return """
+    <h3>Dave quick test</h3>
+    <form method="post" action="/chat" onsubmit="event.preventDefault(); send();">
+      <label>User ID <input id="uid" value="phil-ipad"></label><br/>
+      <label>Message <input id="msg" value="Hello Dave — help me build a recursive assistant."></label><br/>
+      <button>Send</button>
+    </form>
+    <pre id="out"></pre>
+    <script>
+    async function send(){
+      const r = await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({user_id: document.getElementById('uid').value,
+                              message: document.getElementById('msg').value})});
+      document.getElementById('out').textContent = await r.text();
+    }
+    </script>
+    """
 
-# Minimal browser test page (optional)
-@app.get("/test")
-def test():
-    return (
-        "<h3>Dave-PMEA Ultra-Safe</h3>"
-        "<p>Try: <code>/ping</code>, <code>/openapi.json</code></p>"
+# -----------------------------------------------------------------------------
+# OpenAPI "servers" fix so GPT Builder can import cleanly
+# -----------------------------------------------------------------------------
+BASE_URL = os.getenv("APP_BASE_URL", "https://dave-pmea.onrender.com")
+
+from fastapi.openapi.utils import get_openapi
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
     )
+    schema["servers"] = [{"url": BASE_URL}]
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
