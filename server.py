@@ -1,97 +1,89 @@
-# server.py  — Dave-PMEA minimal API with SQLite memory
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List, Dict, Any
 import sqlite3
-from contextlib import closing
-from pathlib import Path
+from datetime import datetime
+from fastapi.openapi.utils import get_openapi
 
-# ---------- App ----------
-app = FastAPI(title="Dave-PMEA", description="PMEA demo API", version="1.0.0")
+app = FastAPI()
 
-# ---------- SQLite (simple, file in working dir) ----------
-DB_PATH = Path("dave_memory.db")
+# --- DB setup (SQLite) ---
+def init_db():
+    conn = sqlite3.connect("dave_memory.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS memory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        role TEXT,
+        text TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    conn.commit()
+    conn.close()
 
-def init_db() -> None:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS memory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                role TEXT NOT NULL,
-                text TEXT NOT NULL,
-                t   DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_t ON memory(t DESC)")
-        conn.commit()
+def save_memory(role: str, text: str):
+    conn = sqlite3.connect("dave_memory.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO memory (role, text) VALUES (?, ?)", (role, text))
+    conn.commit()
+    conn.close()
 
-def save_memory(role: str, text: str) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute("INSERT INTO memory(role, text) VALUES (?, ?)", (role, text))
-        conn.commit()
+def get_memory(limit: int = 20):
+    conn = sqlite3.connect("dave_memory.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT role, text, timestamp FROM memory ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [{"role": r, "text": t, "timestamp": ts} for r, t, ts in rows]
 
-def read_memory(limit: int = 20) -> List[Dict[str, Any]]:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT id, role, text, t FROM memory ORDER BY t DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-# Make sure DB exists on startup
 init_db()
 
-# ---------- Models ----------
+# --- Data model for chat input ---
 class UserInput(BaseModel):
     text: str
 
-# ---------- Routes ----------
+# --- Endpoints ---
 @app.get("/")
-def root() -> Dict[str, Any]:
-    return {
-        "message": "Dave-PMEA is running",
-        "endpoints": {
-            "GET /ping": "health check",
-            "POST /dave": "talk to Dave (body: {'text': 'hello'})",
-            "GET /memory": "last 20 stored lines",
-        },
-    }
+def root():
+    return {"message": "Dave-PMEA is running 🚀"}
 
 @app.get("/ping")
-def ping() -> Dict[str, str]:
+def ping():
     return {"status": "ok"}
 
 @app.post("/dave")
-def dave(user: UserInput) -> Dict[str, str]:
-    # store user turn
-    save_memory("user", user.text)
-
-    # --- PMEA placeholder: DRAFT -> CRITIQUE -> REVISE (simplified) ---
-    # For now we just return a concise, improved echo.
-    reply = f"Improved reply: {user.text}"
-
-    # store assistant turn
+def dave_endpoint(user: UserInput):
+    user_text = user.text
+    reply = f"Improved reply: {user_text}"
+    save_memory("user", user_text)
     save_memory("assistant", reply)
-
     return {"reply": reply}
 
 @app.get("/memory")
-def memory() -> Dict[str, Any]:
-    return {"items": read_memory(limit=20)}
+def memory_endpoint():
+    return get_memory()
 
-# ---------- OpenAPI servers fix (so GPT Builder import-from-URL works) ----------
-from fastapi.openapi.utils import get_openapi
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+@app.get("/api/chat")
+def chat(message: str):
+    reply = f"Improved reply: {message}"
+    save_memory("user", message)
+    save_memory("assistant", reply)
+    return {"reply": reply}
+
+# --- OpenAPI fix (adds servers entry) ---
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
     schema = get_openapi(
-        title=app.title,
-        version=app.version,
+        title="Dave-PMEA",
+        version="1.0.0",
         routes=app.routes,
-        description=app.description,
+        description="OpenAPI for Dave-PMEA"
     )
-    # Update this URL if your Render URL is different
     schema["servers"] = [{"url": "https://dave-pmea.onrender.com"}]
     app.openapi_schema = schema
     return app.openapi_schema
