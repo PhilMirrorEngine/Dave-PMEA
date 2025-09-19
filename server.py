@@ -1,382 +1,218 @@
-import os, re, sqlite3
+# server.py — Dave-PMEA API (ultra-safe, per-user memory)
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from typing import Optional, List, Literal
 from datetime import datetime
-from typing import Optional, List
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+import sqlite3
+import re
 
-# -------- Config --------
-APP_URL = os.getenv("APP_URL", "https://dave-pmea.onrender.com")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # used if OPENAI_API_KEY is set
+app = FastAPI(title="Dave-PMEA", description="PMEA demo API", version="1.0.1")
 
-# -------- App --------
-app = FastAPI(
-    title="Dave-PMEA Ultra-Safe",
-    description="PMEA demo API with per-user memory and Ultra-Safe age modes",
-    version="1.2.0",
-)
+DB_PATH = "dave_memory.db"
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tighten later to your domain(s)
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# -------- DB --------
+# ---------- DB Setup ----------
 def init_db():
-    conn = sqlite3.connect("dave_memory.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # Per-user memory store
     c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id TEXT PRIMARY KEY,
-            age INTEGER,
-            verified INTEGER DEFAULT 0,
-            mode TEXT DEFAULT 'adult'  -- adult | teen | child | blocked
-        )
+    CREATE TABLE IF NOT EXISTS memory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        role    TEXT NOT NULL,
+        text    TEXT NOT NULL,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
     """)
+    # Users + moderation mode
     c.execute("""
-        CREATE TABLE IF NOT EXISTS memory (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT,
-            role TEXT,
-            text TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
+    CREATE TABLE IF NOT EXISTS users (
+        user_id TEXT PRIMARY KEY,
+        age INTEGER,
+        verified INTEGER DEFAULT 0,   -- 0/1
+        mode TEXT                     -- child | teen | adult
+    )
     """)
     conn.commit()
     conn.close()
 
 init_db()
 
-def set_user(user_id: str, age: int):
-    """
-    Ultra-Safe policy:
-      - age >= 18  -> verified=1, mode='adult'
-      - 13 <= age < 18 -> verified=1, mode='teen'
-      - age < 13 -> verified=1, mode='child' (ultra-safe; no persistent memory)
-    """
-    if age >= 18:
-        verified, mode = 1, "adult"
-    elif age >= 13:
-        verified, mode = 1, "teen"
-    else:
-        verified, mode = 1, "child"
-
-    conn = sqlite3.connect("dave_memory.db")
-    c = conn.cursor()
-    c.execute(
-        "INSERT OR REPLACE INTO users (user_id, age, verified, mode) VALUES (?,?,?,?)",
-        (user_id, age, verified, mode),
-    )
-    conn.commit()
-    conn.close()
-    return {"verified": bool(verified), "mode": mode, "age": age}
+# ---------- Helpers ----------
+def determine_mode(age: Optional[int]) -> Literal["child","teen","adult"]:
+    if age is None:
+        return "teen"  # default conservatively
+    if age < 13:
+        return "child"
+    if age < 18:
+        return "teen"
+    return "adult"
 
 def get_user(user_id: str):
-    conn = sqlite3.connect("dave_memory.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT age, verified, mode FROM users WHERE user_id=?", (user_id,))
+    c.execute("SELECT user_id, age, verified, mode FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
     conn.close()
     if not row:
         return None
-    age, verified, mode = row
-    return {"age": age, "verified": bool(verified), "mode": mode}
+    return {"user_id": row[0], "age": row[1], "verified": bool(row[2]), "mode": row[3]}
 
-def save_memory(user_id: str, role: str, text: str):
-    conn = sqlite3.connect("dave_memory.db")
+def upsert_user(user_id: str, age: Optional[int], verified: bool):
+    mode = determine_mode(age)
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        "INSERT INTO memory (user_id, role, text) VALUES (?,?,?)",
-        (user_id, role, text),
-    )
+    c.execute("""
+        INSERT INTO users(user_id, age, verified, mode)
+        VALUES(?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            age=excluded.age,
+            verified=excluded.verified,
+            mode=excluded.mode
+    """, (user_id, age, int(verified), mode))
+    conn.commit()
+    conn.close()
+    return {"user_id": user_id, "age": age, "verified": verified, "mode": mode}
+
+URL_RE = re.compile(r"https?://\S+")
+EMAIL_RE = re.compile(r"\b[\w\.-]+@[\w\.-]+\.\w+\b")
+
+def sanitize_for_teen(text: str) -> str:
+    # strip links/emails, keep it short
+    text = URL_RE.sub("[link removed]", text)
+    text = EMAIL_RE.sub("[email removed]", text)
+    text = text.strip()
+    if len(text) > 240:
+        text = text[:240] + "…"
+    return text
+
+def save_memory(user_id: str, role: Literal["user","assistant"], text: str, mode: str):
+    # child: never store; teen: store sanitized short; adult: store as-is
+    if mode == "child":
+        return
+    if mode == "teen":
+        text = sanitize_for_teen(text)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO memory(user_id, role, text) VALUES (?,?,?)", (user_id, role, text))
     conn.commit()
     conn.close()
 
-def load_memory(user_id: str, limit: int = 20):
-    conn = sqlite3.connect("dave_memory.db")
-    c = conn.cursor()
-    c.execute(
-        "SELECT role, text, timestamp FROM memory WHERE user_id=? ORDER BY id DESC LIMIT ?",
-        (user_id, limit),
-    )
-    rows = c.fetchall()
-    conn.close()
-    return [{"role": r, "text": t, "timestamp": ts} for (r, t, ts) in rows]
+def pmea_reply(mode: str, message: str) -> str:
+    # Minimal PMEA-style improvement with ultra-safe constraints by mode
+    if mode == "child":
+        # short, educational, no links/PII
+        return ("Let's keep this simple and safe:\n"
+                "• I can give you helpful, friendly info.\n"
+                "• If you need anything private or complex, ask a trusted adult.\n"
+                "• What would you like to learn about next?")
+    if mode == "teen":
+        # short, risk-reduced, no links, concise steps
+        safe = sanitize_for_teen(message)
+        return (f"Improved: {safe}\n"
+                "Next: tell me your exact goal and deadline. I’ll give you a short plan.")
+    # adult
+    return (f"Improved reply: {message}\n"
+            "Tip: next, tell me the exact task and target output.")
 
-# -------- Safety Filters --------
-PROFANITY = re.compile(r"\b(fuck|shit|cunt|bitch|bastard|dick|asshole|wank|prick)\b", re.IGNORECASE)
-URLS = re.compile(r"https?://\S+")
-PII = re.compile(r"\b(\d{3}[-.\s]?\d{3}[-.\s]?\d{4}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
-
-# Topics not suitable for teens
-DISALLOWED_TEEN = {
-    "explicit sexual", "porn", "adult content",
-    "detailed drug how-to", "weapon making", "self-harm instructions",
-    "real-money gambling tips", "deepfake creation", "hacking tutorials",
-}
-
-# Topics allowed for child (strict allow-list)
-ALLOWED_CHILD = {
-    "homework", "math", "science", "history", "geography", "reading", "writing",
-    "spelling", "study skills", "school projects", "sports rules", "music basics",
-    "art basics", "healthy habits", "time management", "friendship skills",
-    "online safety", "bullying support", "feelings", "emotion regulation",
-    "asking for help", "curiosity questions", "kid-safe facts",
-}
-
-def scrub_user_text_for_storage(text: str) -> str:
-    # Remove URLs & PII before storing anything for minors
-    t = URLS.sub("[link removed]", text)
-    t = PII.sub("[private removed]", t)
-    return t
-
-def teen_guard(text: str) -> str:
-    t = scrub_user_text_for_storage(text)
-    return PROFANITY.sub("[bleep]", t)
-
-def teen_blocks(text: str) -> bool:
-    low = text.lower()
-    return any(k in low for k in DISALLOWED_TEEN)
-
-def child_allowed(text: str) -> bool:
-    low = text.lower()
-    return any(topic in low for topic in ALLOWED_CHILD)
-
-def teen_sanitize_reply(reply: str) -> str:
-    reply = URLS.sub("[link removed]", reply)
-    reply = PII.sub("[private removed]", reply)
-    reply = PROFANITY.sub("[bleep]", reply)
-    if len(reply) > 700:
-        reply = reply[:680].rstrip() + "…"
-    return (
-        "Here’s a safe, age-appropriate answer:\n"
-        + reply
-        + "\n\nIf this involves health, safety, or personal concerns, please talk with a parent/guardian or trusted adult."
-    )
-
-def child_reply(user_text: str) -> str:
-    # Very short, supportive, educational, and safe
-    return (
-        "I can help with school topics and kid-safe questions. "
-        "Try asking about homework, science, reading, history, or healthy habits. "
-        "If your question feels personal or tricky, please ask a parent/guardian or teacher to help you."
-    )
-
-# -------- PMEA reply (with optional OpenAI) --------
-def pmea_style_reply(prompt: str, mode: str, context_shards: List[str]) -> str:
-    """
-    If OPENAI_API_KEY is present, call OpenAI for a concise answer.
-    Otherwise, return a local structured stub so the API still works.
-    """
-    intro = ""
-    if context_shards:
-        intro = "Recent context:\n- " + "\n- ".join(context_shards[:6]) + "\n\n"
-
-    if not OPENAI_API_KEY:
-        # Local stub
-        return (
-            f"{intro}"
-            f"Answer (local): I understood your request: '{prompt}'. "
-            f"I will keep it {('extra safe' if mode in ['teen','child'] else 'clear and practical')} and concise. "
-            f"Tell me the exact outcome you want and who it’s for."
-        )
-
-    # Live call to OpenAI (minimal)
-    try:
-        # Lazy import to avoid dependency when key not set
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
-
-        system = (
-            "You are Dave — a clear, structured assistant. "
-            "Keep answers short, practical, and safe. "
-            "Always prefer step-by-step with: What it is → How to do it. "
-            "No medical, legal, or adult content for minors."
-        )
-        user = f"{intro}{prompt}"
-
-        res = client.chat.completions.create(
-            model=MODEL,
-            temperature=0.3,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
-        return (res.choices[0].message.content or "").strip()
-    except Exception as e:
-        return (
-            f"{intro}Answer: I understood your request but could not reach the model just now. "
-            f"Error: {e}. I’ll give a brief local suggestion: "
-            f"Break your goal into 2–3 steps and ask me for the first step in detail."
-        )
-
-# -------- Schemas --------
+# ---------- Models ----------
 class AgeVerifyIn(BaseModel):
-    user_id: str
-    age: int
+    user_id: str = Field(..., min_length=1, max_length=128)
+    age: Optional[int] = Field(None, ge=0, le=120)
 
 class ChatIn(BaseModel):
-    user_id: str
-    message: str
-    limit: Optional[int] = 10  # for context recall
+    user_id: str = Field(..., min_length=1, max_length=128)
+    message: str = Field(..., min_length=1)
 
-# -------- Routes --------
+# ---------- Endpoints ----------
 @app.get("/")
 def root():
-    return {"ok": True, "msg": "Dave/PMEA Ultra-Safe API running.", "openapi": f"{APP_URL}/openapi.json"}
-
-@app.get("/status")
-def status():
     return {
-        "ok": True,
-        "app": "Dave-PMEA Ultra-Safe",
-        "version": "1.2.0",
-        "has_openai": bool(OPENAI_API_KEY),
-        "model": MODEL if OPENAI_API_KEY else None,
+        "message": "Dave-PMEA is running 🚀",
+        "endpoints": {
+            "GET /ping": "health ping",
+            "GET /healthz": "health ping",
+            "POST /age-verify": {"user_id": "abc", "age": 17},
+            "POST /chat": {"user_id": "abc", "message": "Hello"},
+            "GET /memory": "/memory?user_id=abc&limit=20"
+        }
     }
+
+@app.get("/ping")
+def ping():
+    return {"ok": True}
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 @app.post("/age-verify")
-def age_verify(body: AgeVerifyIn):
-    if not body.user_id or body.age is None:
-        return JSONResponse({"ok": False, "error": "user_id and age are required"}, status_code=400)
-    info = set_user(body.user_id, body.age)
-    return {"ok": True, "user": info}
-
-@app.get("/memory")
-def memory(user_id: str, limit: int = 20):
-    user = get_user(user_id)
-    if not user:
-        return JSONResponse({"ok": False, "error": "unknown user_id"}, status_code=404)
-    # child mode: no memory is stored
-    if user["mode"] == "child":
-        return {"ok": True, "user_mode": "child", "items": []}
-    items = load_memory(user_id, limit=limit)
-    return {"ok": True, "user_mode": user["mode"], "items": items}
+def age_verify(payload: AgeVerifyIn):
+    profile = upsert_user(payload.user_id, payload.age, verified=True)
+    # child gets safest mode; teen/adult set accordingly
+    return {"ok": True, "user": profile}
 
 @app.post("/chat")
-def chat(body: ChatIn):
-    # ensure user exists
-    user = get_user(body.user_id)
+def chat(payload: ChatIn):
+    # Load user or create a conservative default
+    user = get_user(payload.user_id)
     if not user:
-        # default to child if unknown age (ultra safe)
-        set_user(body.user_id, 10)
-        user = get_user(body.user_id)
-
+        user = upsert_user(payload.user_id, age=None, verified=False)
     mode = user["mode"]
-    raw_text = body.message.strip()
 
-    # select context shards (private per-user)
-    context_items = load_memory(body.user_id, limit=body.limit or 10)
-    context_shards = []
-    for it in context_items:
-        # Only assistant/user message text; keep short
-        text = (it["text"] or "").strip()
-        if text:
-            context_shards.append(text[:160])
+    # Save the user message (unless child)
+    save_memory(payload.user_id, "user", payload.message, mode)
 
-    # Route by mode
-    if mode == "child":
-        # no persistent memory; extremely safe
-        if not child_allowed(raw_text):
-            reply = child_reply(raw_text)
-        else:
-            # Generate a kid-safe short answer (local/OpenAI), then clamp length and add adult guidance
-            base = pmea_style_reply(raw_text, mode, context_shards)
-            base = URLS.sub("[link removed]", base)
-            base = PII.sub("[private removed]", base)
-            if len(base) > 500:
-                base = base[:480].rstrip() + "…"
-            reply = (
-                base
-                + "\n\nRemember: if something feels confusing or personal, please ask a parent/guardian or teacher to help."
-            )
+    # Produce ultra-safe PMEA reply by mode
+    reply = pmea_reply(mode, payload.message)
 
-        # Do NOT store memory for child mode
-        done = reply
-        markers = {
-            "✅ Done": done,
-            "⏳ Next": "Ask about homework, school projects, or a kid-safe topic.",
-            "❌ Blockers": "I avoid grown-up topics in Ultra-Safe mode.",
-            "♻️ Compression": "Short, child-safe reply.",
-            "🌌 Archive": "(not stored for under 13)",
-            "🌀 Spiral": "Not triggered",
-            "mode": mode,
-        }
-        return {"ok": True, "response": reply, "markers": markers}
+    # Save the assistant message (unless child)
+    save_memory(payload.user_id, "assistant", reply, mode)
 
-    if mode == "teen":
-        # block disallowed teen topics; sanitize input and reply; trim storage
-        if teen_blocks(raw_text):
-            safe_msg = (
-                "I can’t help with that topic in teen mode. "
-                "I can support study help, wellbeing basics, and safe life skills. "
-                "If this is important, please talk with a trusted adult."
-            )
-            reply = teen_sanitize_reply(safe_msg)
-            # Store only a minimal assistant note (no user content)
-            save_memory(body.user_id, "assistant", "(Teen-safe refusal issued)")
-            markers = {
-                "✅ Done": reply,
-                "⏳ Next": "Ask about school, career exploration, wellbeing, or practical skills.",
-                "❌ Blockers": "Teen safety policy for risky topics.",
-                "♻️ Compression": "Kept concise; removed links/PII.",
-                "🌌 Archive": "Teen-safe assistant note stored.",
-                "🌀 Spiral": "Not triggered",
-                "mode": mode,
-            }
-            return {"ok": True, "response": reply, "markers": markers}
+    return {"reply": reply, "mode": mode}
 
-        # sanitize user text before storing; generate reply; sanitize reply
-        safe_user = teen_guard(raw_text)
-        # Store a cleaned user summary (not raw text)
-        save_memory(body.user_id, "user", f"(teen) {safe_user[:200]}")
-        base = pmea_style_reply(safe_user, mode, context_shards)
-        reply = teen_sanitize_reply(base)
-        # Store a short assistant summary (not full reply)
-        save_memory(body.user_id, "assistant", "(teen) reply issued")
+@app.get("/memory")
+def get_memory(user_id: str, limit: int = 20):
+    if limit < 1 or limit > 200:
+        raise HTTPException(status_code=400, detail="limit must be 1..200")
 
-        markers = {
-            "✅ Done": reply,
-            "⏳ Next": "Want a simple plan? Say your goal and timeframe.",
-            "❌ Blockers": None,
-            "♻️ Compression": "Links/PII removed; reply length limited.",
-            "🌌 Archive": "Teen-safe summaries stored (short).",
-            "🌀 Spiral": "Not triggered",
-            "mode": mode,
-        }
-        return {"ok": True, "response": reply, "markers": markers}
+    user = get_user(user_id)
+    if not user:
+        # No profile -> nothing stored
+        return {"user_id": user_id, "memory": []}
 
-    # adult mode
-    save_memory(body.user_id, "user", raw_text[:800])
-    base = pmea_style_reply(raw_text, mode, context_shards)
-    reply = base.strip()
-    save_memory(body.user_id, "assistant", reply[:1200])
+    # child never shows anything
+    if user["mode"] == "child":
+        return {"user_id": user_id, "memory": []}
 
-    markers = {
-        "✅ Done": reply,
-        "⏳ Next": "Say the exact outcome you want and who it’s for.",
-        "❌ Blockers": None,
-        "♻️ Compression": "Kept concise by default.",
-        "🌌 Archive": "Per-user memory stored.",
-        "🌀 Spiral": "Not triggered",
-        "mode": mode,
-    }
-    return {"ok": True, "response": reply, "markers": markers}
-
-# -------- Helpful util (dev only) --------
-@app.get("/dev/users")
-def dev_users():
-    # small helper to view users quickly (remove/lock down in production)
-    conn = sqlite3.connect("dave_memory.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT user_id, age, verified, mode FROM users")
+    c.execute("""
+        SELECT role, text, timestamp
+        FROM memory
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+    """, (user_id, limit))
     rows = c.fetchall()
     conn.close()
-    out = [{"user_id": r[0], "age": r[1], "verified": bool(r[2]), "mode": r[3]} for r in rows]
-    return {"ok": True, "users": out}
+    out = [{"role": r[0], "text": r[1], "timestamp": r[2]} for r in rows]
+    return {"user_id": user_id, "memory": out}
+
+# ---------- OpenAPI servers fix (so GPT Builder can import cleanly) ----------
+from fastapi.openapi.utils import get_openapi
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        routes=app.routes,
+        description=app.description,
+    )
+    schema["servers"] = [{"url": "https://dave-pmea.onrender.com"}]  # <-- set to your Render URL
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
